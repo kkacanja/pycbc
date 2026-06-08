@@ -117,25 +117,6 @@ class RatioMatchedFilterControl(object):
         # Internal timing accumulators
         self._kt = self._make_kernel_timers()
 
-    @staticmethod
-    def _make_kernel_timers():
-        return {
-            't_mf_core':       0.0,   # matched_filter_core call
-            't_block_fft':     0.0,   # data block FFTs (block_f_cache misses)
-            't_filter_mult':   0.0,   # fast_multiply_analytic_cython
-            't_ifft':          0.0,   # mkl_fft.ifft calls
-            't_peak_find':     0.0,   # find_peaks_in_block_cython
-            't_geom_cache':    0.0,   # _compute_needed_blocks
-            'n_cache_hits':    0,     # block FFT cache hits
-            'n_cache_misses':  0,     # block FFT cache misses (actual FFTs)
-            'n_filter_batches':0,     # number of (f_start, t_start) kernel iterations
-        }
-
-    def _reset_kernel_timers(self):
-        self._kt = self._make_kernel_timers()
-
-    def get_kernel_timers(self):
-        return dict(self._kt)
 
     def prepare_filters(self, fir_taps, tap_counts):
         n_filters, n_taps = fir_taps.shape
@@ -301,7 +282,6 @@ class RatioMatchedFilterControl(object):
 
             filters_f[start:end] = np.conj(fft_sliced)
         return filters_f
-
 
 
     def _execute_blocked_kernel(self, data, filters_f, n_taps, valid_slice=None, windows=None):
