@@ -1,30 +1,7 @@
-#!/usr/bin/env python
-
-"""
-pycbc_inspiral_ratio: A pipeline-compatible script for inspiral analysis
-using the Ratio Matched Filter method.
-
-Two-stage hierarchical matched filtering:
-  Pass 1 (coarse): Run at full sample rate but with high_frequency_cutoff=coarse_rate/2.
-                   Uses the SAME stilde, PSD, and bank as Pass 2 — no decimation needed.
-                   In the frequency domain, a lower sample rate is equivalent to
-                   truncating the frequency series at the coarse Nyquist frequency.
-  Pass 2 (fine):   Run at full sample rate over the full frequency range, but ONLY
-                   within interest windows derived from Pass 1 trigger times.
-
-Key design
-----------
-* Strain is read ONCE at the native (fine) sample rate.
-* The coarse pass is implemented by setting high_frequency_cutoff = fine_rate/coarse_rate * nyquist
-  on the coarse engine, which limits the matched filter to low frequencies only.
-* Interest windows from Pass 1 are already in fine sample space (same stilde),
-  so no sample-rate mapping is needed.
-* block_f_cache is shared across the whole segment run, not rebuilt per window.
-* FIR filter FFTs (prepare_filters) are computed once per coarse batch.
-"""
+#!/home/kkacanja/.conda/envs/firhier/bin/python3.12
 import cProfile
 import pstats
-import io,os
+import io, os
 
 import argparse
 import logging
@@ -42,10 +19,11 @@ import pycbc.vetoes
 from pycbc.types import complex64, float32, zeros, TimeSeries, FrequencySeries
 from pycbc.conversions import mchirp_from_mass1_mass2
 from pycbc.vetoes.sgchisq import SingleDetSGChisq
-from pycbc.filter.matched_ratio_hier import RatioMatchedFilterControl
+from pycbc.filter.matched_ratio import RatioMatchedFilterControl
 from pycbc.waveform.bank import RatioFilterBank
 
 tstart = time.time()
+
 
 def build_interest_windows(t_idxs, half_window, analyze_start, analyze_stop):
     """
@@ -294,7 +272,6 @@ def main():
         inj_filter_rejector = pycbc.inject.InjFilterRejector.from_cli(args)
 
         # Read strain ONCE at the fine (native) rate.
-        # Both passes will use this same strain — no decimation.
         logging.info(f"Reading strain @ {fine_rate} Hz ...")
         orig_rate        = args.sample_rate
         args.sample_rate = fine_rate
@@ -309,24 +286,18 @@ def main():
         strain_segs = pycbc.strain.StrainSegments.from_cli(args, gwstrain)
         args.sample_rate = orig_rate
 
-        flow        = args.low_frequency_cutoff
-        flen        = strain_segs.freq_len
-        delta_f     = strain_segs.delta_f
+        flow    = args.low_frequency_cutoff
+        flen    = strain_segs.freq_len
+        delta_f = strain_segs.delta_f
 
-        # ------------------------------------------------------------------
-        # Bank — one instance, used for both passes
-        # ------------------------------------------------------------------
+        # Bank
         logging.info("Initialising bank ...")
         bank = RatioFilterBank(
             args.bank_file, filter_length=flen,
             delta_f=delta_f, dtype=np.complex64)
         bank.template_thinning(inj_filter_rejector)
 
-        # ------------------------------------------------------------------
         # Engines
-        # Pass 1 (coarse): same delta_f, same bank, but f_high = coarse_rate/2
-        # Pass 2 (fine):   full frequency range
-        # ------------------------------------------------------------------
         engine_fine = RatioMatchedFilterControl(
             snr_threshold=args.snr_threshold,
             delta_f=delta_f,
@@ -345,16 +316,13 @@ def main():
                 batch_size=args.batch_size,
                 tap_sample_rate=bank.sample_rate,
                 engine_sample_rate=args.coarse_sample_rate)
-            # No stored_sample_rate correction needed — same stilde for both
         else:
             engine_coarse = engine_fine
 
         power_chisq = pycbc.vetoes.SingleDetPowerChisq(
             args.chisq_bins, args.chisq_snr_threshold)
 
-        # ------------------------------------------------------------------
         # Event manager
-        # ------------------------------------------------------------------
         out_types = {
             'time_index':    int,
             'snr':           complex64,
@@ -377,7 +345,7 @@ def main():
 
         cluster_window = int(args.cluster_window * gwstrain.sample_rate)
 
-        # Build freq-domain segments — one set, shared by both passes
+        # Build freq-domain segments
         logging.info("Building freq-domain segments ...")
         segs = strain_segs.fourier_segments()
 
@@ -393,145 +361,103 @@ def main():
                 args.psdvar_psd_duration, args.psdvar_psd_stride,
                 args.psd_estimation, args.psdvar_low_freq, args.psdvar_high_freq)
 
-        seg_ids_local   = []
-        seg_t_idxs      = []
-        seg_snr_sqs     = []
+        # Storage for per-segment results
+        seg_ids_local     = []
+        seg_t_idxs        = []
+        seg_snr_sqs       = []
         seg_fine_mappings = []
-        seg_h_norms     = []
-        seg_coarse_ids  = []
-        seg_chi         = []
-        seg_chi_dof     = []
+        seg_h_norms       = []
+        seg_coarse_ids    = []
+        seg_chi           = []
+        seg_chi_dof       = []
 
-        tsetup = time.time() - tstart
         n_coarse_batches = len(bank.coarse_indices)
 
+        # ==================================================================
         # Main loop — Hierarchical Two-Stage Matching
         # ==================================================================
+        tsetup = time.time() - tstart
         for i, coarse_idx in enumerate(bank.coarse_indices):
-
-            prof['n_batches'] += 1
 
             ref_tmpl           = bank.get_coarse_template(coarse_idx)
             taps, counts, fidx = bank.get_firs(coarse_idx)
 
             # ---- prepare_filters timing ----
-            _t = time.perf_counter()
             filters_f_coarse, _ = engine_coarse.prepare_filters(taps, counts)
             filters_f_fine,   _ = engine_fine.prepare_filters(taps, counts)
-            prof['t_prep_filters'] += time.perf_counter() - _t
 
-            logging.info(f"  Ratio Batch {i+1}/{n_coarse_batches}, {len(taps)} FIR templates")
+            logging.info(f"Batch {i+1}/{n_coarse_batches}: {len(taps)} FIR templates")
 
             for s_num in range(len(segs)):
                 stilde = segs[s_num]
-                seg_len = stilde.analyze.stop - stilde.analyze.start
-
-                logging.info(f"Processing Segment {s_num}")
 
                 # ---- Pass 1: Coarse Scan ----
                 logging.info(f"   Seg {s_num} | Pass 1 (f<{coarse_f_high} Hz)")
-                t1_p1 = time.time()
-                ids_p1, t_p1, snrs_p1, h_norm_c, total_loops_c, loops_exec_c = \
+
+                t1=time.time()
+                ids_p1, t_p1, snrs_p1, h_norm_c = \
                     engine_coarse.process_segment_coarse(
                         stilde, stilde.psd,
                         ref_tmpl, filters_f_coarse, counts,
                         np.arange(len(fidx)),
                         valid_slice=stilde.analyze,
                     )
-                t2_p1 = time.time()
-                
-                t_pass1_seg = t2_p1 - t1_p1
-                prof['t_pass1']       += t_pass1_seg
-                prof['n_coarse_cands'] += len(ids_p1)
-                prof['n_seg_samps']   += seg_len
-                prof['n_segs']        += 1
-
-                logging.info(f"     → {len(ids_p1)} coarse candidates [{t_pass1_seg:.3f}s]")
-                
-                # Base Style Performance Telemetry for Pass 1
-                tperf_p1 = (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t / max(t2_p1 - t1_p1, 1e-9) * len(taps)
-                logging.info(f"     batch perf (Pass 1): {tperf_p1} templates s/s")
-
-                if len(ids_p1) == 0:
-                    # Still need to count the loops that would have been done
-                    # in Pass 2 so block_coverage denominator stays correct.
-                    # process_segment_fine on an empty window set returns quickly;
-                    # we use total_loops_c as a proxy for total_loops_f here.
-                    prof['loops_total'] += total_loops_c
-                    continue
+                t2=time.time()
+                t_pass1_seg = t2-t1
+                logging.info(f"     → {len(ids_p1)} coarse candidates "
+                             f"[{t_pass1_seg:.3f}s]")
 
                 # Map time indices to native 2048 Hz space
                 decimate = int(np.round(bank.sample_rate / args.coarse_sample_rate))
                 fine_mapped_t_p1 = t_p1.copy() * decimate
-
+            
                 # ---- build_interest_windows timing ----
-                _t = time.perf_counter()
                 windows = build_interest_windows(
                     fine_mapped_t_p1,
                     args.interest_window,
                     stilde.analyze.start,
                     stilde.analyze.stop,
                 )
-                prof['t_build_windows'] += time.perf_counter() - _t
-                prof['n_windows'] += len(windows)
-                prof['n_window_samps']  += sum(e - s for s, e in windows)
 
-                window_coverage_seg = (sum(e - s for s, e in windows) /
-                                       max(seg_len, 1))
-                logging.info(f"     → {len(windows)} interest windows, "
-                             f"coverage {window_coverage_seg*100:.2f}% of segment")
+                # ---- Window activation diagnostics ----
+                seg_len = stilde.analyze.stop - stilde.analyze.start
+                window_samps = sum(e - s for s, e in windows)
+                activation = window_samps / max(seg_len, 1)
+                logging.info(f"   → {len(windows)} windows, "
+                             f"{window_samps}/{seg_len} fine samples "
+                             f"({activation*100:.1f}% activation)")
+
+
+                if len(windows) == 0:
+                    logging.info(f"   Seg {s_num} | Pass 2 skipped (no windows)")
+                    continue
 
                 # ---- Pass 2: Fine Sweep ----
                 logging.info(f"   Seg {s_num} | Pass 2 (full freq, {len(windows)} windows)")
-                t1_p2 = time.time()
-                ids_local, t_idxs, snrs, h_norm_f, total_loops_f, loops_exec_f = \
+                t1 = time.time()
+                ids_local, t_idxs, snrs, h_norm_f = \
                     engine_fine.process_segment_fine(
                         stilde, stilde.psd,
                         ref_tmpl, filters_f_fine, counts,
                         fidx, windows=windows
                     )
-                t2_p2 = time.time()
-                
-                t_pass2_seg = t2_p2 - t1_p2
-                prof['t_pass2']       += t_pass2_seg
-                prof['n_fine_triggers'] += len(ids_local)
-                prof['loops_exec']    += loops_exec_f
-                prof['loops_total']   += total_loops_f
-
-                block_coverage_seg = loops_exec_f / max(total_loops_f, 1)
-                logging.info(f"     → {len(ids_local)} fine triggers "
-                             f"[{t_pass2_seg:.3f}s]  "
-                             f"block coverage {block_coverage_seg*100:.2f}%  "
-                             f"speedup vs full sweep "
-                             f"{1.0/max(block_coverage_seg,1e-9):.1f}x")
-
+                t2= time.time()
+                t_pass2_seg = t2-t1
                 # Per-segment Pass1 vs Pass2 time ratio diagnostic
                 logging.info(f"     T_pass2/T_pass1 this seg: "
-                             f"{t_pass2_seg/max(t_pass1_seg,1e-9):.3f}  "
-                             f"(ideal ≈ {block_coverage_seg:.3f})")
-
-                # Base Style Performance Telemetry for Pass 2 (Calculated before the chisq tracking step)
-                tperf_p2 = (stilde.analyze.stop - stilde.analyze.start) * stilde.delta_t / max(t2_p2 - t1_p2, 1e-9) * len(taps)
-                logging.info(f"     batch perf (Pass 2): {tperf_p2} templates s/s")
+                             f"{t_pass2_seg/max(t_pass1_seg,1e-9):.3f}")
 
                 if len(ids_local) == 0:
                     continue
 
                 # ---- Chi-squared timing ----
                 tstarts_local = np.full(len(ids_local), stilde.analyze.start)
-                _t = time.perf_counter()
                 chi, chi_dof = compute_batch_chisq(
                     ids_local, t_idxs, snrs, h_norm_f,
                     fidx, tstarts_local, stilde, bank,
                     power_chisq, engine_fine, filters_f_fine, ref_tmpl, args)
-                t_chisq_seg = time.perf_counter() - _t
-                prof['t_chisq']       += t_chisq_seg
-                prof['n_chisq_iters'] += int((chi_dof > 0).sum())
 
-                logging.info(f"   chisq: {(chi_dof > 0).sum()}/{len(chi_dof)} triggers "
-                             f"have valid chisq [{t_chisq_seg:.3f}s]  "
-                             f"T_chisq/T_pass2: "
-                             f"{t_chisq_seg/max(t_pass2_seg,1e-9):.3f}")
+                logging.info(f"   chisq coverage: {(chi_dof > 0).sum()}/{len(chi_dof)} triggers have valid chisq")
 
                 # ---- Final GPS alignment shift ----
                 t_idxs += (-stilde.analyze.start + stilde.cumulative_index)
@@ -547,26 +473,15 @@ def main():
                 seg_chi_dof.append(chi_dof)
 
 
-        # Print cProfile results
-#        for name, pr in [("PASS1_COARSE", pr_pass1), ("PASS2_FINE", pr_pass2)]:
- #           print(f"\n{'='*60}")
-  #          print(f" {name} PROFILE")
-   #         print(f"{'='*60}")
-    #        s = io.StringIO()
-     #       ps = pstats.Stats(pr, stream=s).sort_stats('cumulative')
-      #      ps.print_stats(20)
-        #    print(s.getvalue())
-       # pr_pass1.dump_stats("pass1.prof")
-        #pr_pass2.dump_stats("pass2.prof")
-####################################################################################################################################
-
+        # ---- Event collection timing ----
         logging.info("Grouping triggers...")
+
         triggers_by_template = {}
         for k in range(len(seg_ids_local)):
             cid  = seg_coarse_ids[k]
             norm = seg_h_norms[k]
             for j, lid in enumerate(seg_ids_local[k]):
-                gid = lid  # lid is already the global ID
+                gid = lid
                 if gid not in triggers_by_template:
                     triggers_by_template[gid] = ([], [], [], [], [], [])
                 rec = triggers_by_template[gid]
@@ -599,9 +514,6 @@ def main():
             out_vals['chisq']   = chi
             out_vals['chisq_dof'] = chi_dof
 
-#            logging.info(f"snr_rescale for gid {gid}: {snr_rescale:.4f}, "
- #               f"raw snr max: {np.max(np.abs(snr)):.4f}, "
-  #              f"rescaled snr max: {np.max(np.abs(np.array(snr)/snr_rescale)):.4f}")
             if args.psdvar_short_segment is not None:
                 out_vals['psd_var_val'] = pycbc.psd.find_trigger_value(
                     psd_var, out_vals['time_index'],
@@ -621,23 +533,12 @@ def main():
                                                   cluster_window)
             event_mgr.finalize_template_events()
 
-    # Finalize
-    tstop    = time.time()
+
+    # ---- Write output timing ----
+    tstop = time.time()
     run_time = tstop - tstart
     event_mgr.save_performance(1, len(segs), len(bank), run_time, tsetup)
     logging.info("Consolidating and writing events...")
-####################################################################################################################################
-
-#    logging.info(f"gwstrain start_time: {gwstrain.start_time}")
- #   logging.info(f"strain_segs start_time: {strain_segs.start_time if hasattr(strain_segs, 'start_time') else 'N/A'}")
-  #  logging.info(f"args.gps_start_time: {args.gps_start_time}")
-   # logging.info(f"First seg cumulative_index: {segs[0].cumulative_index}")
-    #logging.info(f"First seg delta_t: {segs[0].delta_t}")
-    #logging.info(f"Implied GPS of first trigger sample: "
-     #           f"{gwstrain.start_time + segs[0].cumulative_index * segs[0].delta_t}")
-#    event_mgr.consolidate_events(args, gwstrain=strain_segs)
-####################################################################################################################################
-
     event_mgr.consolidate_events(args, gwstrain=gwstrain)
     event_mgr.finalize_events()
     event_mgr.write_events(args.output)
