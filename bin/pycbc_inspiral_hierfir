@@ -1,4 +1,4 @@
-#!/home/kkacanja/.conda/envs/firhier/bin/python3.12
+#!/usr/bin/env python
 import cProfile
 import pstats
 import io, os
@@ -19,7 +19,7 @@ import pycbc.vetoes
 from pycbc.types import complex64, float32, zeros, TimeSeries, FrequencySeries
 from pycbc.conversions import mchirp_from_mass1_mass2
 from pycbc.vetoes.sgchisq import SingleDetSGChisq
-from pycbc.filter.matched_ratio import RatioMatchedFilterControl
+from pycbc.filter.matched_ratio_time import RatioMatchedFilterControl
 from pycbc.waveform.bank import RatioFilterBank
 
 tstart = time.time()
@@ -383,9 +383,21 @@ def main():
             taps, counts, fidx = bank.get_firs(coarse_idx)
 
             # ---- prepare_filters timing ----
-            filters_f_coarse, _ = engine_coarse.prepare_filters(taps, counts)
-            filters_f_fine,   _ = engine_fine.prepare_filters(taps, counts)
-
+#            a1 = time.time()
+ #           filters_f_coarse, _ = engine_coarse.prepare_filters(taps, counts)
+  #          a2 = time.time()
+   #         print(f"time to execute filters_f_coarse{a2-a1}")
+#
+ #           b1 = time.time()
+  #          filters_f_fine,   _ = engine_fine.prepare_filters(taps, counts)
+   #         b2 = time.time()
+    #        print(f"time to execute filters_f_fine{b2-b1}")
+            b1 = time.time()
+            filters_f_fine, filters_f_coarse, _ = engine_fine.prepare_filters(
+                taps, counts, coarse_engine=engine_coarse
+            )
+            b2 = time.time()
+            print(f"time to execute prepare_filters_combined{b2-b1}")
             logging.info(f"Batch {i+1}/{n_coarse_batches}: {len(taps)} FIR templates")
 
             for s_num in range(len(segs)):
@@ -403,6 +415,8 @@ def main():
                         valid_slice=stilde.analyze,
                     )
                 t2=time.time()
+                print(f"time for engine_coarse_process_segments:{t2-t1}")
+
                 t_pass1_seg = t2-t1
                 logging.info(f"     → {len(ids_p1)} coarse candidates "
                              f"[{t_pass1_seg:.3f}s]")
@@ -412,13 +426,15 @@ def main():
                 fine_mapped_t_p1 = t_p1.copy() * decimate
             
                 # ---- build_interest_windows timing ----
+                t1=time.time()
                 windows = build_interest_windows(
                     fine_mapped_t_p1,
                     args.interest_window,
                     stilde.analyze.start,
                     stilde.analyze.stop,
                 )
-
+                t2=time.time()
+                print(f"time to build_interest_windows:{t2-t1}")
                 # ---- Window activation diagnostics ----
                 seg_len = stilde.analyze.stop - stilde.analyze.start
                 window_samps = sum(e - s for s, e in windows)
@@ -442,6 +458,7 @@ def main():
                         fidx, windows=windows
                     )
                 t2= time.time()
+                print(f"time for engine_fine_process_segments:{t2-t1}")
                 t_pass2_seg = t2-t1
                 # Per-segment Pass1 vs Pass2 time ratio diagnostic
                 logging.info(f"     T_pass2/T_pass1 this seg: "
