@@ -28,8 +28,10 @@ tstart = time.time()
 def build_interest_windows(t_idxs, half_window, analyze_start, analyze_stop):
     """
     Expand trigger sample indices by half_window, merge overlapping intervals.
-    Both coarse and fine passes use the same stilde, so t_idxs are already
-    in fine sample space — no rate mapping needed.
+
+    If two coarse triggers are close together in time, their windows can overlap. 
+    Rather than processing the same time region twice, they get merged into 
+    one contiguous window.
 
     Returns list of (start, stop) int pairs.
     """
