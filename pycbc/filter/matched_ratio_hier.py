@@ -1,26 +1,11 @@
 #!/home/kkacanja/.conda/envs/firhier/bin/python3.12
-import cProfile
-import pstats
-import io, os
-
-import argparse
 import logging
 import numpy as np
 import time
 import mkl_fft
 
 import pycbc
-import pycbc.strain
-import pycbc.psd
-import pycbc.events
-import pycbc.scheme
-import pycbc.fft
-import pycbc.inject
-import pycbc.vetoes
-import pycbc.filter
 from pycbc.types import complex64, float32, zeros, TimeSeries, FrequencySeries
-from pycbc.conversions import mchirp_from_mass1_mass2
-from pycbc.vetoes.sgchisq import SingleDetSGChisq
 from pycbc.filter.matchedfilter import matched_filter_core
 from pycbc.filter.matchedfilter_cpu import fast_multiply_analytic_cython, find_peaks_in_block_cython
 
@@ -114,47 +99,11 @@ class RatioMatchedFilterControl(object):
         # Direct MKL handle
         self.fft_lib = mkl_fft
 
-        # Internal timing accumulators
-        self._kt = self._make_kernel_timers()
-
-    @staticmethod
-    def _make_kernel_timers():
-        return {
-            't_mf_core':       0.0,   # matched_filter_core call
-            't_block_fft':     0.0,   # data block FFTs (block_f_cache misses)
-            't_filter_mult':   0.0,   # fast_multiply_analytic_cython
-            't_ifft':          0.0,   # mkl_fft.ifft calls
-            't_peak_find':     0.0,   # find_peaks_in_block_cython
-            't_geom_cache':    0.0,   # _compute_needed_blocks
-            'n_cache_hits':    0,     # block FFT cache hits
-            'n_cache_misses':  0,     # block FFT cache misses (actual FFTs)
-            'n_filter_batches':0,     # number of (f_start, t_start) kernel iterations
-        }
-
-    def _reset_kernel_timers(self):
-        self._kt = self._make_kernel_timers()
-
-    def get_kernel_timers(self):
-        return dict(self._kt)
 
     def prepare_filters(self, fir_taps, tap_counts, coarse_engine):
         """
         Compute both fine and coarse filters from a single high-res FFT pass.
-        
-        The bank taps are at bank_rate (2048 Hz). The coarse engine has a higher
-        decimation factor so needs a longer FFT. We compute the long FFT once,
-        then:
-        - coarse filters: slice [:fir_fft_len] of the high-res FFT (what
-                            coarse engine's _fft_all_filters already does)
-        - fine filters:   take every decimation_factor-th bin from the high-res
-                            FFT to get the fine-rate filter, equivalent to what
-                            fine engine's _fft_all_filters does with decimation=1
-        
-        Parameters
-        ----------
-        fir_taps    : (n_filters, n_taps) array
-        tap_counts  : (n_filters,) int array
-        coarse_engine : the coarse RatioMatchedFilterControl instance
+        Optimized for zero-allocation memory bandwidth.
         """
         n_filters, n_taps_alloc = fir_taps.shape
         if n_taps_alloc >= self.fir_fft_len:
@@ -164,41 +113,54 @@ class RatioMatchedFilterControl(object):
         fine_dec   = int(np.round(self.tap_sr   / self.engine_sr))    # 1
         coarse_dec = int(np.round(coarse_engine.tap_sr / coarse_engine.engine_sr))  # 4
 
-        # always use the coarse (larger) FFT length as the high-res base
-        # since coarse_dec >= fine_dec
+        # High-res base
         high_res_fft_len = self.fir_fft_len * coarse_dec   # 4096 * 4 = 16384
 
         filters_f_fine   = np.zeros((n_filters, self.fir_fft_len),          dtype=np.complex64)
         filters_f_coarse = np.zeros((n_filters, coarse_engine.fir_fft_len), dtype=np.complex64)
 
+        # Pre-allocate buffer once for the entire batching process
         high_res_padded = np.zeros((self.batch_size, high_res_fft_len), dtype=np.complex64)
+        
+        N_c = coarse_engine.fir_fft_len
+        half_N = N_c // 2
 
         for start in range(0, n_filters, self.batch_size):
             end       = min(start + self.batch_size, n_filters)
             batch_len = end - start
 
+            # 1. Zero out processing buffer (Fastest way to reset)
             high_res_padded[:batch_len, :] = 0.0
-            high_res_padded[:batch_len, :n_taps_alloc] = fir_taps[start:end]
 
-            # Roll taps by -counts//2 (same logic as _fft_all_filters)
+            tmp_taps = fir_taps[start:end]
             current_counts = tap_counts[start:end]
-            roll_offsets   = -(current_counts // 2)
-            cols           = np.arange(high_res_fft_len)
-            rows           = np.arange(batch_len)[:, None]
-            shifted_cols   = (cols[None, :] - roll_offsets[:, None]) % high_res_fft_len
-            current_data   = high_res_padded[:batch_len].copy()
-            high_res_padded[:batch_len] = current_data[rows, shifted_cols]
 
-            # Single FFT at high resolution
+            # 2. Fast Time-Domain Roll (Zero Matrix Allocation)
+            # Directly maps the shifted taps to avoid multi-megabyte fancy indexing
+            for b in range(batch_len):
+                count = current_counts[b]
+                k = count // 2
+                
+                # Shift remainder of template to the front
+                high_res_padded[b, :count - k] = tmp_taps[b, k:count]
+                # Wrap front of template to the extreme back
+                high_res_padded[b, -k:] = tmp_taps[b, :k]
+
+            # 3. Execute FFT
             fft_high_res = self.fft_lib.fft(high_res_padded[:batch_len], axis=-1)
 
-            # Coarse filters: slice first fir_fft_len bins (same as coarse _fft_all_filters)
-            filters_f_coarse[start:end] = np.conj(fft_high_res[:batch_len, :coarse_engine.fir_fft_len])
+            # 4. In-Place Conjugate
+            # Modifies the array in memory, saving 3 intermediate array allocations
+            np.conjugate(fft_high_res, out=fft_high_res)
 
-            # Fine filters: decimate by coarse_dec in frequency domain
-            # Every coarse_dec-th bin of the high-res FFT corresponds to the
-            # fine-rate filter (equivalent to fine engine's decimation=1 path)
-            filters_f_fine[start:end] = np.conj(fft_high_res[:batch_len, ::coarse_dec][:, :self.fir_fft_len])
+            # 5. Direct Slicing (using the pre-conjugated array)
+            
+            # Coarse: Reconstruct conjugate symmetry
+            filters_f_coarse[start:end, :half_N + 1] = fft_high_res[:, :half_N + 1]
+            filters_f_coarse[start:end, half_N + 1:] = fft_high_res[:, -(half_N - 1):]
+
+            # Fine: Decimate by coarse_dec
+            filters_f_fine[start:end] = fft_high_res[:, ::coarse_dec][:, :self.fir_fft_len]
 
         n_taps_max = int(np.max(tap_counts))
         return filters_f_fine, filters_f_coarse, n_taps_max
@@ -254,6 +216,9 @@ class RatioMatchedFilterControl(object):
                     int(valid_slice.start // decimate),
                     int(valid_slice.stop  // decimate)
                 )
+                print(f"[DEBUG] coarse ref_snr len={len(self.ref_snr)}, "
+                  f"valid_slice={kernel_slice}, "
+                  f"decimate={decimate}")
             else:
                 kernel_slice = None
             t2 = time.time()
@@ -304,15 +269,21 @@ class RatioMatchedFilterControl(object):
         n_filters = len(filters_f)
         
         N_FFT = self.fir_fft_len
-        
+        print(f"[DEBUG] n_taps raw max={n_taps.max()}, quantile nsizes={nsizes}, "
+              f"N_VALID per group would be={[self.fir_fft_len - s + 1 for s in nsizes]}")    
+
+        n_batches = (n_filters + self.batch_size - 1) // self.batch_size
+        print(f"[DEBUG] n_filters={n_filters}, batch_size={self.batch_size}, "
+              f"n_batches={n_batches}")
+
         all_f_idxs = []
         all_t_idxs = []
         all_snrs = []
         all_tstarts = []
-
+ 
         freq_mult_view = self.temp_freq_mult
         corr_out_view = self.corr_output_buffer
-
+ 
         if valid_slice:
             v_start = valid_slice.start
             v_stop = valid_slice.stop
@@ -321,11 +292,8 @@ class RatioMatchedFilterControl(object):
             v_stop = n_samples
  
         block_f_cache = {}
-        geometry_cache = {}  
-        
-        total_loops = 0
-        loops_executed = 0
-
+        geometry_cache = {}
+ 
         # --- OUTER LOOP: Filter Batches ---
         for f_start in range(0, n_filters, self.batch_size):  
             f_end = min(f_start + self.batch_size, n_filters)
@@ -342,89 +310,97 @@ class RatioMatchedFilterControl(object):
             N_VALID = N_FFT - n_taps_max + 1
             STEP = N_VALID
             bad_start = n_taps_max // 2
-
+ 
             # Route 1: Specific Interest Windows
-            d1 = d2 = 0
-            d1 = time.time()
             if windows is not None and len(windows) > 0:
+#                d1 = time.time()
                 if N_VALID not in geometry_cache:
                     geometry_cache[N_VALID] = _compute_needed_blocks(
                         windows, bad_start, N_VALID, n_samples
                     )
                 block_starts, roi_starts, roi_stops = geometry_cache[N_VALID]
-                iterator = zip(block_starts, roi_starts, roi_stops)
-                d2 = time.time()
-                self._window_compute_time += (d2 - d1)
-            # Route 2: Full Valid Slice Sweep
+#                self._window_compute_time += time.time() - d1
+ 
+                for t_start, roi_start, roi_stop in zip(block_starts, roi_starts, roi_stops):
+                    roi_len = roi_stop - roi_start
+                    if roi_len <= 0:
+                        continue
+ 
+                    buf_slice_start = roi_start - t_start
+                    t_end = min(t_start + N_FFT, n_samples)
+ 
+                    if t_start not in block_f_cache:
+#                        _fft_t1 = time.time()
+                        block_in_view = np.zeros(self.fir_fft_len, dtype=complex64)
+                        block_in_view[0:t_end-t_start] = data[t_start:t_end]
+                        block_f_view = self.fft_lib.fft(block_in_view)
+                        block_f_cache[t_start] = block_f_view
+#                        self._block_fft_time += time.time() - _fft_t1
+#                        self._block_fft_count += 1
+ 
+                    block_f_view = block_f_cache[t_start]
+                    fast_multiply_analytic_cython(
+                        block_f_view, filters_f[f_start:f_end], current_mult_view
+                    )
+                    self.fft_lib.ifft(current_mult_view, axis=-1, out=current_corr_view)
+                    f_list, t_list, s_list = find_peaks_in_block_cython(
+                        current_corr_view, roi_start, roi_len,
+                        self.threshold_sq, f_start, input_offset=buf_slice_start
+                    )
+                    if f_list:
+                        all_f_idxs.extend(f_list)
+                        all_t_idxs.extend(t_list)
+                        all_snrs.extend(s_list)
+                        all_tstarts.extend([t_start] * len(s_list))
+            # Route 2: Full Valid Slice Sweep — direct loop matching base code
             else:
                 first_block_idx = (v_start - bad_start) // STEP
                 loop_start = first_block_idx * STEP
-
-                def _slice_iterator():
-                    for t_st in range(loop_start, n_samples, STEP):
-                        block_valid_t0 = t_st + bad_start
-                        if block_valid_t0 >= v_stop: break
-                        if block_valid_t0 + N_VALID <= v_start: continue
-                        r_start = max(v_start, block_valid_t0)
-                        r_stop = min(v_stop, block_valid_t0 + N_VALID)
-                        if r_stop > r_start:
-                            yield t_st, r_start, r_stop
-                            
-                iterator = _slice_iterator()
-
-            for t_start, roi_start, roi_stop in iterator:
-                total_loops += 1
-                roi_len = roi_stop - roi_start
-                if roi_len <= 0: 
-                    continue
-                
-                loops_executed += 1
-                buf_slice_start = roi_start - t_start
-
-                t_end = min(t_start + N_FFT, n_samples)
-                if t_start not in block_f_cache:
-                    _fft_t1 = time.time()
-                    block_in_view = np.zeros(self.fir_fft_len, dtype=complex64)
-                    block_in_view[0:t_end-t_start] = data[t_start:t_end]
-                    block_f_view = self.fft_lib.fft(block_in_view)
-                    block_f_cache[t_start] = block_f_view
-                    self._block_fft_time += time.time() - _fft_t1
-                    self._block_fft_count += 1
-                
-                block_f_view = block_f_cache[t_start]
-                filter_batch_f = filters_f[f_start:f_end]
-                c1=time.time()
-                fast_multiply_analytic_cython(
-                    block_f_view, filter_batch_f, current_mult_view
-                )
-                c2=time.time()
-                b1=time.time()
-                self.fft_lib.ifft(
-                    current_mult_view, 
-                    axis=-1, 
-                    out=current_corr_view
-                )
-                b2=time.time()
-
-                a1=time.time()
-                f_list, t_list, s_list = find_peaks_in_block_cython(
-                    current_corr_view, 
-                    roi_start,          
-                    roi_len,            
-                    self.threshold_sq, 
-                    f_start,
-                    input_offset=buf_slice_start
-                )
-                a2=time.time()
-                if f_list:
-                    all_f_idxs.extend(f_list)
-                    all_t_idxs.extend(t_list)
-                    all_snrs.extend(s_list)
-                    all_tstarts.extend([t_start] * len(s_list)) 
-
-        print(f"[TIMING] total _compute_needed_blocks time = {self._window_compute_time:.6f} s")
-        print(f"[TIMING] block_fft: {self._block_fft_count} FFTs, {self._block_fft_time:.6f} s total")
-
+ 
+                for t_start in range(loop_start, n_samples, STEP):
+                    block_valid_t0 = t_start + bad_start
+ 
+                    if block_valid_t0 >= v_stop:
+                        break
+                    if block_valid_t0 + N_VALID <= v_start:
+                        continue
+ 
+                    roi_start = max(v_start, block_valid_t0)
+                    roi_stop  = min(v_stop, block_valid_t0 + N_VALID)
+                    roi_len   = roi_stop - roi_start
+                    if roi_len <= 0:
+                        continue
+ 
+                    buf_slice_start = roi_start - t_start
+                    t_end = min(t_start + N_FFT, n_samples)
+ 
+                    if t_start not in block_f_cache:
+#                        _fft_t1 = time.time()
+                        block_in_view = np.zeros(self.fir_fft_len, dtype=complex64)
+                        block_in_view[0:t_end-t_start] = data[t_start:t_end]
+                        block_f_view = self.fft_lib.fft(block_in_view)
+                        block_f_cache[t_start] = block_f_view
+#                        self._block_fft_time += time.time() - _fft_t1
+ #                       self._block_fft_count += 1
+ 
+                    block_f_view = block_f_cache[t_start]
+                    fast_multiply_analytic_cython(
+                        block_f_view, filters_f[f_start:f_end], current_mult_view
+                    )
+                    self.fft_lib.ifft(current_mult_view, axis=-1, out=current_corr_view)
+                    f_list, t_list, s_list = find_peaks_in_block_cython(
+                        current_corr_view, roi_start, roi_len,
+                        self.threshold_sq, f_start, input_offset=buf_slice_start
+                    )
+                    if f_list:
+                        all_f_idxs.extend(f_list)
+                        all_t_idxs.extend(t_list)
+                        all_snrs.extend(s_list)
+                        all_tstarts.extend([t_start] * len(s_list)) 
+ 
+ #       print(f"[TIMING] total _compute_needed_blocks time = {self._window_compute_time:.6f} s")
+#        print(f"[TIMING] block_fft: {self._block_fft_count} FFTs, {self._block_fft_time:.6f} s total")
+ 
         return (np.array(all_f_idxs, dtype=np.int32), 
                 np.array(all_t_idxs, dtype=np.int64), 
                 np.array(all_snrs, dtype=np.complex64))
