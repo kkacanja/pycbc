@@ -19,7 +19,7 @@ import pycbc.vetoes
 from pycbc.types import complex64, float32, zeros, TimeSeries, FrequencySeries
 from pycbc.conversions import mchirp_from_mass1_mass2
 from pycbc.vetoes.sgchisq import SingleDetSGChisq
-from pycbc.filter.matched_ratio_time import RatioMatchedFilterControl
+from pycbc.filter.matched_ratio_hier import RatioMatchedFilterControl
 from pycbc.waveform.bank import RatioFilterBank
 
 tstart = time.time()
