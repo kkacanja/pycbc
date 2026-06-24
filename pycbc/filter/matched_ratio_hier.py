@@ -1,4 +1,3 @@
-#!/home/kkacanja/.conda/envs/firhier/bin/python3.12
 import logging
 import numpy as np
 import time
@@ -216,9 +215,6 @@ class RatioMatchedFilterControl(object):
                     int(valid_slice.start // decimate),
                     int(valid_slice.stop  // decimate)
                 )
-                print(f"[DEBUG] coarse ref_snr len={len(self.ref_snr)}, "
-                  f"valid_slice={kernel_slice}, "
-                  f"decimate={decimate}")
             else:
                 kernel_slice = None
             t2 = time.time()
@@ -269,12 +265,8 @@ class RatioMatchedFilterControl(object):
         n_filters = len(filters_f)
         
         N_FFT = self.fir_fft_len
-        print(f"[DEBUG] n_taps raw max={n_taps.max()}, quantile nsizes={nsizes}, "
-              f"N_VALID per group would be={[self.fir_fft_len - s + 1 for s in nsizes]}")    
 
         n_batches = (n_filters + self.batch_size - 1) // self.batch_size
-        print(f"[DEBUG] n_filters={n_filters}, batch_size={self.batch_size}, "
-              f"n_batches={n_batches}")
 
         all_f_idxs = []
         all_t_idxs = []
@@ -313,13 +305,11 @@ class RatioMatchedFilterControl(object):
  
             # Route 1: Specific Interest Windows
             if windows is not None and len(windows) > 0:
-#                d1 = time.time()
                 if N_VALID not in geometry_cache:
                     geometry_cache[N_VALID] = _compute_needed_blocks(
                         windows, bad_start, N_VALID, n_samples
                     )
                 block_starts, roi_starts, roi_stops = geometry_cache[N_VALID]
-#                self._window_compute_time += time.time() - d1
  
                 for t_start, roi_start, roi_stop in zip(block_starts, roi_starts, roi_stops):
                     roi_len = roi_stop - roi_start
@@ -330,13 +320,10 @@ class RatioMatchedFilterControl(object):
                     t_end = min(t_start + N_FFT, n_samples)
  
                     if t_start not in block_f_cache:
-#                        _fft_t1 = time.time()
                         block_in_view = np.zeros(self.fir_fft_len, dtype=complex64)
                         block_in_view[0:t_end-t_start] = data[t_start:t_end]
                         block_f_view = self.fft_lib.fft(block_in_view)
                         block_f_cache[t_start] = block_f_view
-#                        self._block_fft_time += time.time() - _fft_t1
-#                        self._block_fft_count += 1
  
                     block_f_view = block_f_cache[t_start]
                     fast_multiply_analytic_cython(
@@ -375,13 +362,10 @@ class RatioMatchedFilterControl(object):
                     t_end = min(t_start + N_FFT, n_samples)
  
                     if t_start not in block_f_cache:
-#                        _fft_t1 = time.time()
                         block_in_view = np.zeros(self.fir_fft_len, dtype=complex64)
                         block_in_view[0:t_end-t_start] = data[t_start:t_end]
                         block_f_view = self.fft_lib.fft(block_in_view)
                         block_f_cache[t_start] = block_f_view
-#                        self._block_fft_time += time.time() - _fft_t1
- #                       self._block_fft_count += 1
  
                     block_f_view = block_f_cache[t_start]
                     fast_multiply_analytic_cython(
@@ -397,10 +381,7 @@ class RatioMatchedFilterControl(object):
                         all_t_idxs.extend(t_list)
                         all_snrs.extend(s_list)
                         all_tstarts.extend([t_start] * len(s_list)) 
- 
- #       print(f"[TIMING] total _compute_needed_blocks time = {self._window_compute_time:.6f} s")
-#        print(f"[TIMING] block_fft: {self._block_fft_count} FFTs, {self._block_fft_time:.6f} s total")
- 
+  
         return (np.array(all_f_idxs, dtype=np.int32), 
                 np.array(all_t_idxs, dtype=np.int64), 
                 np.array(all_snrs, dtype=np.complex64))
