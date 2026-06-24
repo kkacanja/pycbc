@@ -47,6 +47,13 @@ def compute_batch_chisq(ids_local, t_idxs, snrs, h_norm,
                         fine_indices, tstarts, stilde, bank, chisq_estimator,
                         engine, filters_f, ref_template, args):
     logging.info('starting chisq calculation')
+
+    fallback_sr = getattr(stilde, 'sample_rate', getattr(args, 'sample_rate', 2048))
+    
+    if getattr(bank, 'sample_rate', None) is None:
+        logging.warning(f"Bank missing root sample_rate. Dynamically setting to fallback: {fallback_sr} Hz")
+        bank.sample_rate = fallback_sr
+
     chisq_window_samp = int(args.chisq_window * stilde.sample_rate)
     max_iterations = args.chisq_iterations
 
